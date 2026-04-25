@@ -1,3 +1,10 @@
+# RLM (jphein fork)
+
+**JP's fork of [alexzhang13/rlm](https://github.com/alexzhang13/rlm)** — the reference implementation of Recursive Language Models from the Zhang/Kraska/Khattab arXiv preprint ([2512.24601](https://arxiv.org/abs/2512.24601)) and Oct 2025 [blogpost](https://alexzhang13.github.io/blog/2025/rlm/).
+
+Forked 2026-04-25 to evaluate RLM as a **consumption layer for [MemPalace](https://github.com/jphein/mempalace)** — a verbatim local memory archive currently storing ~151K drawers of conversation + project history. The composition: RLM's recursive LM gets `mempalace_search` as one of the tools its REPL can call, so the LM can programmatically pull from outside its context window without a hand-written retrieval pipeline. This addresses MemPalace's open "auto-surfacing context Claude doesn't know to ask for" problem from the inference side rather than the storage side.
+
+Tracking `upstream/main` for now; planned fork work is integration glue (MemPalace tool wrappers, sample notebooks, a `palace-daemon`-aware sandbox config), not changes to RLM core. Upstream README follows below unchanged.
 
 ---
 
