@@ -52,6 +52,7 @@ from rlm.environments.base_env import (
     extract_tool_value,
     validate_custom_tools,
 )
+from rlm.environments.local_repl import _AnswerDict
 
 KernelMode = Literal["in_process", "subprocess"]
 
@@ -97,21 +98,21 @@ _ANSI_RE = re.compile(
 
 class _SubcallBroker:
     """TCP broker that the subprocess kernel calls back into for rlm_query
-    and FINAL_VAR results.
+    and final-answer results.
 
     Reuses the 4-byte-length-prefix JSON protocol from ``rlm.core.comms_utils``.
 
-    Request types (all subcall/final_var requests carry a ``cell_id`` so
-    the parent can attribute completions to the cell that triggered them
-    even if ``subcall_fn`` finishes after that cell has timed out):
+    Request types (all carry a ``cell_id`` so the parent can attribute
+    completions / final answers to the cell that triggered them even if
+    ``subcall_fn`` finishes after that cell has timed out):
         {"type": "subcall", "prompt": str, "model": str | None, "cell_id": str}
         {"type": "subcall_batched", "prompts": [str], "model": str | None, "cell_id": str}
-        {"type": "final_var", "value": str, "cell_id": str}
+        {"type": "answer", "content": str, "cell_id": str}
 
     Responses:
         subcall:          {"completion": RLMChatCompletion.to_dict()} | {"error": str}
         subcall_batched:  {"responses": [str]}                        | {"error": str}
-        final_var:        {"ok": True}
+        answer:           {"ok": True}
     """
 
     def __init__(
@@ -193,10 +194,10 @@ class _SubcallBroker:
 
         cell_id = data.get("cell_id") or ""
 
-        if req_type == "final_var":
-            value = data.get("value")
+        if req_type == "answer":
+            content = data.get("content")
             with self._lock:
-                self._final_answers_by_cell[cell_id] = str(value) if value is not None else ""
+                self._final_answers_by_cell[cell_id] = str(content) if content is not None else ""
             return {"ok": True}
 
         if req_type == "subcall":
@@ -321,7 +322,7 @@ def _build_kernel_bootstrap(
         _RLM_DEPTH = {depth}
         _RLM_SUBCALL_TIMEOUT = {subcall_timeout!r}
         # Updated by the parent before each user cell. Tagged onto every
-        # broker request so completions / FINAL_VAR answers can be
+        # broker request so completions / answer-dict captures can be
         # attributed to the cell that originated them.
         _RLM_CURRENT_CELL = ""
 
@@ -415,43 +416,28 @@ def _build_kernel_bootstrap(
                 return [f"Error: {{resp['error']}}"] * len(prompts)
             return list(resp.get("responses") or [])
 
-        def FINAL_VAR(variable):
-            if not isinstance(variable, str):
-                answer = str(variable)
-                _rlm_request(_RLM_SUBCALL_ADDRESS, {{
-                    "type": "final_var", "value": answer,
-                    "cell_id": _RLM_CURRENT_CELL,
-                }})
-                return answer
-            name = variable.strip().strip('"\\'')
-            ns = get_ipython().user_ns
-            if name in ns:
-                answer = str(ns[name])
-                _rlm_request(_RLM_SUBCALL_ADDRESS, {{
-                    "type": "final_var", "value": answer,
-                    "cell_id": _RLM_CURRENT_CELL,
-                }})
-                return answer
-            skip = {{"In", "Out", "exit", "quit", "get_ipython"}}
-            available = [
-                k for k in ns.keys()
-                if not k.startswith("_") and k not in skip
-            ]
-            if available:
-                return (
-                    f"Error: Variable {{name!r}} not found. "
-                    f"Available variables: {{available}}. "
-                    "You must create and assign a variable BEFORE calling FINAL_VAR on it."
-                )
-            return (
-                f"Error: Variable {{name!r}} not found. "
-                "No variables have been created yet. "
-                "You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
-            )
+        class _RLMAnswerDict(dict):
+            def __init__(self):
+                super().__init__()
+                dict.__setitem__(self, "content", "")
+                dict.__setitem__(self, "ready", False)
+            def __setitem__(self, key, value):
+                dict.__setitem__(self, key, value)
+                if key == "ready" and value:
+                    try:
+                        _rlm_request(_RLM_SUBCALL_ADDRESS, {{
+                            "type": "answer",
+                            "content": str(self.get("content", "")),
+                            "cell_id": _RLM_CURRENT_CELL,
+                        }})
+                    except Exception:
+                        pass
+
+        answer = _RLMAnswerDict()
 
         def SHOW_VARS():
             ns = get_ipython().user_ns
-            skip = {{"In", "Out", "exit", "quit", "get_ipython"}}
+            skip = {{"In", "Out", "exit", "quit", "get_ipython", "answer"}}
             available = {{
                 k: type(v).__name__
                 for k, v in ns.items()
@@ -491,7 +477,7 @@ class IPythonREPL(NonIsolatedEnv):
           namespace, cwd, and signals.
 
     Subcall attribution caveat (subprocess mode):
-        Subcall completions and FINAL_VAR answers are tagged with the
+        Subcall completions and final-answer captures are tagged with the
         ``cell_id`` that was active *at the moment the kernel issued the
         request*. If a cell spawns long-lived kernel-side state (a
         ``threading.Thread``, an ``asyncio.Task`` left running, a
@@ -524,10 +510,10 @@ class IPythonREPL(NonIsolatedEnv):
         startup_timeout: Max seconds to wait for a ``subprocess`` kernel to
             become ready.
         subcall_timeout: Per-request timeout (seconds) for the kernel→parent
-            socket round-trip used by ``llm_query`` / ``rlm_query`` /
-            ``FINAL_VAR`` in subprocess mode. ``None`` (default) disables
-            the timeout, which matches in-process behavior where subcalls
-            block indefinitely.
+            socket round-trip used by ``llm_query`` / ``rlm_query`` and the
+            answer-dict broker push in subprocess mode. ``None`` (default)
+            disables the timeout, which matches in-process behavior where
+            subcalls block indefinitely.
         max_concurrent_subcalls: Cap on concurrent ``rlm_query_batched`` calls.
     """
 
@@ -716,9 +702,9 @@ class IPythonREPL(NonIsolatedEnv):
         ns["llm_query_batched"] = self._llm_query_batched
         ns["rlm_query"] = self._rlm_query
         ns["rlm_query_batched"] = self._rlm_query_batched
-        ns["FINAL_VAR"] = self._final_var
         ns["SHOW_VARS"] = self._show_vars
         ns["input"] = self._disabled_input
+        ns["answer"] = _AnswerDict(on_ready=self._capture_answer)
 
         # Inject custom tools
         for name, entry in self.custom_tools.items():
@@ -845,31 +831,9 @@ class IPythonREPL(NonIsolatedEnv):
     # Scaffold helpers (in-process only; subprocess has its own in the kernel)
     # -------------------------------------------------------------------------
 
-    def _final_var(self, variable_name: str | Any) -> str:
-        if not isinstance(variable_name, str):
-            answer = str(variable_name)
-            self._last_final_answer = answer
-            return answer
-        name = variable_name.strip().strip("\"'")
-        ns = self._shell.user_ns if self._shell is not None else {}
-        if name in ns:
-            answer = str(ns[name])
-            self._last_final_answer = answer
-            return answer
-        available = [
-            k for k in ns.keys() if not k.startswith("_") and k not in _IPYTHON_INTERNAL_NAMES
-        ]
-        if available:
-            return (
-                f"Error: Variable '{name}' not found. "
-                f"Available variables: {available}. "
-                f"You must create and assign a variable BEFORE calling FINAL_VAR on it."
-            )
-        return (
-            f"Error: Variable '{name}' not found. "
-            f"No variables have been created yet. "
-            f"You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
-        )
+    def _capture_answer(self, content: Any) -> None:
+        """Called by ``_AnswerDict`` when the model sets ``answer["ready"] = True``."""
+        self._last_final_answer = str(content)
 
     @staticmethod
     def _disabled_input(*_args: Any, **_kwargs: Any) -> str:
@@ -889,7 +853,7 @@ class IPythonREPL(NonIsolatedEnv):
         available = {
             k: type(v).__name__
             for k, v in ns.items()
-            if not k.startswith("_") and k not in _IPYTHON_INTERNAL_NAMES
+            if not k.startswith("_") and k not in _IPYTHON_INTERNAL_NAMES and k != "answer"
         }
         if not available:
             return "No variables created yet. Use ```repl``` blocks to create variables."
@@ -1305,7 +1269,7 @@ class IPythonREPL(NonIsolatedEnv):
         start_time = time.perf_counter()
 
         # Generate a unique cell_id so the broker can attribute every
-        # subcall completion / FINAL_VAR answer to *this* cell. A subcall
+        # subcall completion / answer-dict capture to *this* cell. A subcall
         # whose ``subcall_fn`` finishes after this cell times out will
         # land under this id and stay there until the next drain (which
         # discards it as stale).
@@ -1391,7 +1355,7 @@ class IPythonREPL(NonIsolatedEnv):
             else:
                 stderr_parts.append(f"\n{ename}: {evalue}")
 
-        # Drain broker state (rlm_query completions, FINAL_VAR answer)
+        # Drain broker state (rlm_query completions, answer-dict capture)
         # *for this cell only*. Stragglers from prior timed-out cells live
         # under their own cell_id; ``drain(cell_id)`` discards them rather
         # than attributing them to this cell.
@@ -1422,9 +1386,19 @@ class IPythonREPL(NonIsolatedEnv):
         ns["llm_query_batched"] = self._llm_query_batched
         ns["rlm_query"] = self._rlm_query
         ns["rlm_query_batched"] = self._rlm_query_batched
-        ns["FINAL_VAR"] = self._final_var
         ns["SHOW_VARS"] = self._show_vars
         ns["input"] = self._disabled_input
+        # Rewrap ``answer`` if the user rebound it to a plain dict, so
+        # subsequent ``ready=True`` assignments still trigger capture.
+        current = ns.get("answer")
+        if not isinstance(current, _AnswerDict):
+            replacement = _AnswerDict(on_ready=self._capture_answer)
+            if isinstance(current, dict):
+                for k, v in current.items():
+                    dict.__setitem__(replacement, k, v)
+                if current.get("ready") and self._last_final_answer is None:
+                    self._last_final_answer = str(current.get("content", ""))
+            ns["answer"] = replacement
         if "context_0" in ns:
             ns["context"] = ns["context_0"]
         if "history_0" in ns:
