@@ -119,30 +119,28 @@ def test_in_process_exposes_locals_dict():
 
 
 # -----------------------------------------------------------------------------
-# FINAL_VAR
+# Final answer via the ``answer`` dict
 # -----------------------------------------------------------------------------
 
 
 @BOTH_MODES
-def test_final_var_returns_variable(kernel_mode: str):
+def test_answer_ready_surfaces_final_answer(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        repl.execute_code("answer = 'forty-two'")
-        result = repl.execute_code('FINAL_VAR("answer")')
+        result = repl.execute_code('answer["content"] = "forty-two"\nanswer["ready"] = True')
     assert result.final_answer == "forty-two"
 
 
 @BOTH_MODES
-def test_final_var_missing_variable(kernel_mode: str):
+def test_answer_not_ready_returns_none(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        result = repl.execute_code('FINAL_VAR("does_not_exist")')
+        result = repl.execute_code('answer["content"] = "wip"')
     assert result.final_answer is None
-    assert "not found" in result.stdout.lower() or "not found" in result.stderr.lower()
 
 
 @BOTH_MODES
-def test_final_var_accepts_direct_value(kernel_mode: str):
+def test_answer_content_is_stringified(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        result = repl.execute_code("FINAL_VAR(123)")
+        result = repl.execute_code('answer["content"] = 123\nanswer["ready"] = True')
     assert result.final_answer == "123"
 
 
@@ -663,9 +661,9 @@ def test_stale_subcall_completion_not_misattributed_to_next_cell():
 
 
 @pytest.mark.skipif(not _has_subprocess, reason="jupyter_client not installed")
-def test_stale_final_var_not_misattributed_to_next_cell():
-    """Same logic for ``FINAL_VAR`` — a final-answer set by a prior cell's
-    delayed code path must not surface as the next cell's final answer."""
+def test_stale_final_answer_not_misattributed_to_next_cell():
+    """A final answer set by a prior cell's delayed code path must not
+    surface as the next cell's final answer."""
 
     barrier = threading.Event()
 
@@ -693,17 +691,16 @@ def test_stale_final_var_not_misattributed_to_next_cell():
         subcall_fn=slow_subcall,
         cell_timeout=0.1,
     ) as repl:
-        r1 = repl.execute_code('rlm_query("p"); FINAL_VAR("late-A")')
+        r1 = repl.execute_code(
+            'rlm_query("p")\nanswer["content"] = "late-A"\nanswer["ready"] = True'
+        )
         assert "TimeoutError" in r1.stderr
-        # Cell A is over with no FINAL_VAR captured.
+        # Cell A is over with no final answer captured.
         assert r1.final_answer is None
 
         # Now release subcall_fn and let it complete. If cell A's
-        # FINAL_VAR were globally stored (by old code), it would now be
+        # answer were globally stored (by old code), it would now be
         # in the broker waiting for the next drain to pick it up.
-        # (Note: in this test FINAL_VAR happens after rlm_query, which
-        # the timeout already prevented — but the same path is exercised
-        # by any straggler.)
         barrier.set()
         time.sleep(0.3)
 
@@ -711,7 +708,7 @@ def test_stale_final_var_not_misattributed_to_next_cell():
         r2 = repl.execute_code("print('clean')")
 
     assert r2.final_answer is None, (
-        f"cell B must not inherit cell A's stale FINAL_VAR; got {r2.final_answer!r}"
+        f"cell B must not inherit cell A's stale final answer; got {r2.final_answer!r}"
     )
 
 
@@ -731,7 +728,7 @@ def test_in_process_cell_cannot_reenter_via_scaffold_self():
     """
     with IPythonREPL(kernel_mode="in_process") as repl:
         # ``rlm_query`` is a bound method; ``rlm_query.__self__`` is the
-        # parent REPL. Any other scaffold (llm_query, FINAL_VAR, ...)
+        # parent REPL. Any other scaffold (llm_query, SHOW_VARS, ...)
         # would work just as well as a reentry vector.
         result = repl.execute_code("rlm_query.__self__.execute_code('print(\"inner\")')")
     assert (

@@ -214,13 +214,11 @@ class TestUtilsImports:
         """Test parsing module import."""
         from rlm.utils.parsing import (
             find_code_blocks,
-            find_final_answer,
             format_execution_result,
             format_iteration,
         )
 
         assert callable(find_code_blocks)
-        assert callable(find_final_answer)
         assert callable(format_iteration)
         assert callable(format_execution_result)
 

@@ -22,6 +22,31 @@ from rlm.environments.base_env import (
     validate_custom_tools,
 )
 
+
+class _AnswerDict(dict):
+    """REPL-visible dict where ``answer["ready"] = True`` signals completion.
+
+    Behaves exactly like ``dict`` for the model, but invokes ``on_ready`` the
+    first time ``ready`` flips truthy. The callback receives the current
+    ``content``, lets the env capture it (in-process attr, broker push, etc.),
+    and the next ``execute_code`` will surface it as ``REPLResult.final_answer``.
+    """
+
+    def __init__(self, on_ready=None):
+        super().__init__()
+        super().__setitem__("content", "")
+        super().__setitem__("ready", False)
+        self._on_ready = on_ready
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if key == "ready" and value and self._on_ready is not None:
+            try:
+                self._on_ready(self.get("content", ""))
+            except Exception:
+                pass
+
+
 # =============================================================================
 # Safe Builtins
 # =============================================================================
@@ -191,16 +216,20 @@ class LocalREPL(NonIsolatedEnv):
 
         # Track LLM calls made during code execution
         self._pending_llm_calls: list[RLMChatCompletion] = []
-        # When FINAL_VAR is called inside a REPL block, we store the value here for the main loop
+        # Captured the first time the model sets ``answer["ready"] = True``.
         self._last_final_answer: str | None = None
 
         # Add helper functions
-        self.globals["FINAL_VAR"] = self._final_var
         self.globals["SHOW_VARS"] = self._show_vars
         self.globals["llm_query"] = self._llm_query
         self.globals["llm_query_batched"] = self._llm_query_batched
         self.globals["rlm_query"] = self._rlm_query
         self.globals["rlm_query_batched"] = self._rlm_query_batched
+
+        # The model marks completion via ``answer["ready"] = True``; the
+        # custom dict captures the content as soon as that happens so we
+        # don't have to probe the namespace after every cell.
+        self.locals["answer"] = _AnswerDict(on_ready=self._capture_answer)
 
         # Add custom tools to globals
         # Tools can be either plain values or (value, description) tuples
@@ -212,35 +241,16 @@ class LocalREPL(NonIsolatedEnv):
                 # For non-callable values (constants, data), add to locals
                 self.locals[name] = value
 
-    def _final_var(self, variable_name: str | Any) -> str:
-        """Return the value of a variable as a final answer for the main model, or stringify a direct value."""
-        if not isinstance(variable_name, str):
-            answer = str(variable_name)
-            self._last_final_answer = answer
-            return answer
-        variable_name = variable_name.strip().strip("\"'")
-        if variable_name in self.locals:
-            answer = str(self.locals[variable_name])
-            self._last_final_answer = answer
-            return answer
-
-        # Provide helpful error message with available variables (do not set _last_final_answer)
-        available = [k for k in self.locals.keys() if not k.startswith("_")]
-        if available:
-            return (
-                f"Error: Variable '{variable_name}' not found. "
-                f"Available variables: {available}. "
-                f"You must create and assign a variable BEFORE calling FINAL_VAR on it."
-            )
-        return (
-            f"Error: Variable '{variable_name}' not found. "
-            f"No variables have been created yet. "
-            f"You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
-        )
+    def _capture_answer(self, content: Any) -> None:
+        self._last_final_answer = str(content)
 
     def _show_vars(self) -> str:
         """Show all available variables in the REPL environment."""
-        available = {k: type(v).__name__ for k, v in self.locals.items() if not k.startswith("_")}
+        available = {
+            k: type(v).__name__
+            for k, v in self.locals.items()
+            if not k.startswith("_") and k != "answer"
+        }
         if not available:
             return "No variables created yet. Use ```repl``` blocks to create variables."
         return f"Available variables: {available}"
@@ -512,10 +522,21 @@ class LocalREPL(NonIsolatedEnv):
                 self.globals["rlm_query"] = self._rlm_query
             elif name == "rlm_query_batched":
                 self.globals["rlm_query_batched"] = self._rlm_query_batched
-            elif name == "FINAL_VAR":
-                self.globals["FINAL_VAR"] = self._final_var
             elif name == "SHOW_VARS":
                 self.globals["SHOW_VARS"] = self._show_vars
+            elif name == "answer":
+                current = self.locals.get("answer")
+                # If the model rebound ``answer`` to a plain dict, the
+                # _AnswerDict callback never fired; capture content here if
+                # ``ready=True``, then re-wrap so the next cell signals.
+                if not isinstance(current, _AnswerDict):
+                    replacement = _AnswerDict(on_ready=self._capture_answer)
+                    if isinstance(current, dict):
+                        for k, v in current.items():
+                            dict.__setitem__(replacement, k, v)
+                        if current.get("ready") and self._last_final_answer is None:
+                            self._last_final_answer = str(current.get("content", ""))
+                    self.locals["answer"] = replacement
             elif name == "context" and "context_0" in self.locals:
                 self.locals["context"] = self.locals["context_0"]
             elif name == "history" and "history_0" in self.locals and not self.compaction:

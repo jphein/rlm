@@ -216,17 +216,11 @@ def serialize_locals(state):
 
 _locals = load_state()
 
-def FINAL_VAR(variable_name):
-    variable_name = variable_name.strip().strip("\\"\\'")
-    if variable_name in _locals:
-        return str(_locals[variable_name])
-    available = [k for k in _locals.keys() if not k.startswith("_")]
-    if available:
-        return f"Error: Variable '{{variable_name}}' not found. Available variables: {{available}}. You must create and assign a variable BEFORE calling FINAL_VAR on it."
-    return f"Error: Variable '{{variable_name}}' not found. No variables have been created yet. You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
+if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
+    _locals["answer"] = {{"content": "", "ready": False}}
 
 def SHOW_VARS():
-    available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_")}}
+    available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
     if not available:
         return "No variables created yet. Use ```repl``` blocks to create variables."
     return f"Available variables: {{available}}"
@@ -236,7 +230,6 @@ _globals = {{
     "__name__": "__main__",
     "llm_query": llm_query,
     "llm_query_batched": llm_query_batched,
-    "FINAL_VAR": FINAL_VAR,
     "SHOW_VARS": SHOW_VARS,
 }}
 
@@ -268,10 +261,13 @@ if "history_0" in _locals:
 
 save_state(_locals)
 
+_ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
+_final = str(_ans.get("content", "")) if (_ans is not None and _ans.get("ready")) else None
 result = {{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": serialize_locals(_locals),
+    "final_answer": _final,
 }}
 print(json.dumps(result))
 '''
@@ -556,6 +552,7 @@ class PrimeREPL(IsolatedEnv):
                 locals=parsed.get("locals", {}),
                 execution_time=execution_time,
                 rlm_calls=pending_calls,
+                final_answer=parsed.get("final_answer"),
             )
         except json.JSONDecodeError:
             return REPLResult(

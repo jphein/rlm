@@ -207,18 +207,14 @@ def serialize_locals(state):
 
 _locals = load_state()
 
-def FINAL_VAR(variable_name):
-    variable_name = variable_name.strip().strip("\\"\\'")
-    if variable_name in _locals:
-        return str(_locals[variable_name])
-    return f"Error: Variable '{{variable_name}}' not found"
+if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
+    _locals["answer"] = {{"content": "", "ready": False}}
 
 _globals = {{
     "__builtins__": __builtins__,
     "__name__": "__main__",
     "llm_query": llm_query,
     "llm_query_batched": llm_query_batched,
-    "FINAL_VAR": FINAL_VAR,
 }}
 
 code = base64.b64decode("{code_b64}").decode()
@@ -249,10 +245,13 @@ if "history_0" in _locals:
 
 save_state(_locals)
 
+_ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
+_final = str(_ans.get("content", "")) if (_ans is not None and _ans.get("ready")) else None
 result = {{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": serialize_locals(_locals),
+    "final_answer": _final,
 }}
 print(json.dumps(result))
 '''
@@ -475,6 +474,7 @@ class E2BREPL(IsolatedEnv):
                 locals=parsed.get("locals", {}),
                 execution_time=execution_time,
                 rlm_calls=pending_calls,
+                final_answer=parsed.get("final_answer"),
             )
         except json.JSONDecodeError:
             return REPLResult(
